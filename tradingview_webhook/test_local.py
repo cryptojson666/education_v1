@@ -4,25 +4,28 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
-TOKEN = os.getenv("WEBHOOK_SIGNATURE_SECRET")  # 當作共享密鑰
+TOKEN = os.getenv("WEBHOOK_SIGNATURE_SECRET")
 API_KEY = os.getenv("WEBHOOK_API_KEY")
 URL = "http://localhost:8000/webhook"
 
-# 1. 構建 Body (含 token 欄位)
+# 模擬 TradingView 真實 Payload 結構
 payload_dict = {
     "token": TOKEN,
     "api_key": API_KEY,
-    "timestamp": int(time.time()),
-    "payload": {"ticker": "BTCUSDT", "price": 65000, "action": "buy"}
+    "timestamp": "{{timenow}}",  # 字串格式，TV 會自動替換
+    "payload": {
+        "ticker": "BTCUSDT",
+        "exchange": "BINANCE",
+        "price": 65000.0,
+        "time": "{{time}}",
+        "action": "buy",  # 實際測試時請改為 buy/sell，而非模板字串
+        "comment": "test"
+    }
 }
 
-# 2. 序列化
+# 序列化
 body_bytes = json.dumps(payload_dict, separators=(',', ':'), sort_keys=True).encode('utf-8')
-
-headers = {
-    "Content-Type": "application/json",
-    # 不再需要 X-Signature, X-Timestamp, X-API-Key Header
-}
+headers = {"Content-Type": "application/json"}
 
 print("Sending test request (Body Token)...")
 print(f"Body: {body_bytes.decode()}")
