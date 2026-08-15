@@ -201,6 +201,9 @@ class BitunixClient:
             "tradeSide": "OPEN",             # 開倉
             "effect": "GTC",                 # Good Till Cancelled
             "reduceOnly": False,
+            "marginCoin": "USDT",            # 必填
+            "leverage": str(leverage),       # 槓桿
+            "marginMode": "ISOLATED" if margin_mode == "isolated" else "CROSSED",  # 大寫
         }
         
         return self._request("POST", "/api/v1/futures/trade/place_order", data=data)
