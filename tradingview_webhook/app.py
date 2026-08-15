@@ -91,13 +91,33 @@ class BitunixClient:
 
     # ---------- Public API (依官方文檔) ----------
     def get_account_balance(self, margin_coin: str = "USDT") -> float:
-        """獲取 USDT 可用餘額 (equity) - GET /api/v1/account/assets"""
-        data = self._request("GET", "/api/v1/account/assets")
-        for asset in data.get("assets", []):
-            if asset.get("marginCoin") == margin_coin:
-                # equity = 總權益, available = 可用餘額
-                return float(asset.get("equity", 0))
-        return 0.0
+        """獲取 USDT 可用餘額 (equity) - 嘗試多個可能端點"""
+        endpoints = [
+            "/api/v1/account/assets",
+            "/api/v1/account/asset",
+            "/api/v1/account/balance",
+            "/api/v1/user/assets",
+            "/api/v1/user/balance",
+            "/api/v2/account/assets",
+        ]
+        
+        for endpoint in endpoints:
+            try:
+                print(f"🔄 Trying balance endpoint: {endpoint}")
+                data = self._request("GET", endpoint)
+                # 解析回傳格式可能不同
+                assets = data.get("assets") or data.get("list") or data.get("data") or data
+                if isinstance(assets, dict):
+                    assets = [assets]
+                for asset in assets:
+                    if asset.get("marginCoin") == margin_coin or asset.get("coin") == margin_coin or asset.get("currency") == margin_coin:
+                        equity = asset.get("equity") or asset.get("available") or asset.get("balance") or asset.get("total")
+                        if equity:
+                            return float(equity)
+            except Exception as e:
+                print(f"⚠️ Balance endpoint {endpoint} failed: {e}")
+                continue
+        raise Exception("All balance endpoints failed")
 
     def get_ticker_price(self, symbol: str) -> float:
         """獲取最新標記價格 - GET /api/v1/market/ticker"""
@@ -368,6 +388,41 @@ async def test_balance():
         return {"status": "success", "equity": equity}
     except Exception as e:
         raise HTTPException(500, str(e))
+
+@app.get("/test/debug/endpoints")
+async def test_endpoints():
+    """測試所有可能的端點"""
+    results = {}
+    endpoints = [
+        "/api/v1/account/assets",
+        "/api/v1/account/asset",
+        "/api/v1/account/balance",
+        "/api/v1/user/assets",
+        "/api/v1/user/balance",
+        "/api/v2/account/assets",
+        "/api/v1/account/assets?marginCoin=USDT",
+        "/api/v1/account/asset?marginCoin=USDT",
+    ]
+    
+    for endpoint in endpoints:
+        try:
+            # 直接用 session 請求看原始回應
+            timestamp = str(int(time.time() * 1000))
+            sign = bitunix._sign(timestamp, "GET", endpoint, "")
+            headers = {
+                "Content-Type": "application/json",
+                "API-KEY": bitunix.api_key,
+                "PASSPHRASE": bitunix.passphrase,
+                "TIMESTAMP": timestamp,
+                "SIGN": sign,
+            }
+            url = f"{bitunix.base_url}{endpoint}"
+            resp = bitunix.session.get(url, headers=headers, timeout=5)
+            results[endpoint] = {"status": resp.status_code, "data": resp.json()}
+        except Exception as e:
+            results[endpoint] = {"error": str(e)}
+    
+    return results
 
 @app.get("/test/ticker")
 async def test_ticker(symbol: str = "BTCUSDT"):
