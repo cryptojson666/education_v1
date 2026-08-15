@@ -2,23 +2,27 @@
 import json, time, requests
 from dotenv import load_dotenv
 import os
+from datetime import datetime, timezone
 
 load_dotenv()
 TOKEN = os.getenv("WEBHOOK_SIGNATURE_SECRET")
 API_KEY = os.getenv("WEBHOOK_API_KEY")
 URL = "http://localhost:8000/webhook"
 
-# 模擬 TradingView 真實 Payload 結構
+# 模擬 TradingView 真實 Payload 結構（使用實際時間值，非佔位符）
+now_iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+now_ts = str(int(time.time()))
+
 payload_dict = {
     "token": TOKEN,
     "api_key": API_KEY,
-    "timestamp": "{{timenow}}",  # 字串格式，TV 會自動替換
+    "timestamp": now_ts,  # Unix timestamp 字串
     "payload": {
         "ticker": "BTCUSDT",
         "exchange": "BINANCE",
         "price": 65000.0,
-        "time": "{{time}}",
-        "action": "buy",  # 實際測試時請改為 buy/sell，而非模板字串
+        "time": now_iso,  # ISO 8601 格式
+        "action": "buy",
         "comment": "test"
     }
 }
