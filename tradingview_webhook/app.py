@@ -3,7 +3,6 @@ import time
 import hmac
 import hashlib
 import base64
-import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -22,7 +21,7 @@ WEBHOOK_API_KEY = os.getenv("WEBHOOK_API_KEY")
 WEBHOOK_SIGNATURE_SECRET = os.getenv("WEBHOOK_SIGNATURE_SECRET")
 WEBHOOK_TIMESTAMP_TOLERANCE = int(os.getenv("WEBHOOK_TIMESTAMP_TOLERANCE", "300"))
 
-# Bitunix 設定 (Passphrase 可選，若無請留空)
+# Bitunix 設定
 BITUNIX_API_KEY = os.getenv("BITUNIX_API_KEY")
 BITUNIX_SECRET_KEY = os.getenv("BITUNIX_SECRET_KEY")
 BITUNIX_PASSPHRASE = os.getenv("BITUNIX_PASSPHRASE", "")
@@ -36,13 +35,14 @@ TRADE_TP_PERCENT = float(os.getenv("TRADE_TP_PERCENT", "0.05"))
 TRADE_MARGIN_MODE = os.getenv("TRADE_MARGIN_MODE", "isolated")
 
 app = FastAPI(
-    title="TradingView Webhook Receiver + Bitunix Auto Trade",
-    description="接收 TradingView Alert -> 驗證 -> Bitunix 自動下單 (1% Equity, 10x, SL/TP 5%)",
-    version="2.0.0"
+    title="TradingView Webhook -> Bitunix Auto Trade",
+    description="TV Alert -> 驗證 -> Bitunix 自動下單 (1% Equity, 10x, SL/TP 5%)",
+    version="2.1.0"
 )
 
 # ============================================================
-# Bitunix API Client
+# Bitunix API Client (依官方 Futures API v1 文檔)
+# 參考: https://www.bitunix.com/api-docs/futures/common/introduction.html
 # ============================================================
 class BitunixClient:
     def __init__(self):
@@ -89,81 +89,76 @@ class BitunixClient:
         except requests.exceptions.RequestException as e:
             raise Exception(f"Network Error: {e}")
 
-    # ---------- Public Methods ----------
+    # ---------- Public API (依官方文檔) ----------
     def get_account_balance(self, margin_coin: str = "USDT") -> float:
-        """獲取 USDT 可用餘額 (equity)"""
+        """獲取 USDT 可用餘額 (equity) - GET /api/v1/account/assets"""
         data = self._request("GET", "/api/v1/account/assets")
         for asset in data.get("assets", []):
             if asset.get("marginCoin") == margin_coin:
+                # equity = 總權益, available = 可用餘額
                 return float(asset.get("equity", 0))
         return 0.0
 
     def get_ticker_price(self, symbol: str) -> float:
-        """獲取最新標記價格"""
+        """獲取最新標記價格 - GET /api/v1/market/ticker"""
         data = self._request("GET", "/api/v1/market/ticker", params={"symbol": symbol})
-        # Bitunix 回傳格式通常包含 lastPr 或 markPrice
         tick = data.get("ticker") or data
-        return float(tick.get("lastPr") or tick.get("markPrice") or tick.get("lastPrice"))
+        # Bitunix 回傳欄位通常為 lastPr (最新成交價) 或 markPrice
+        return float(tick.get("lastPr") or tick.get("markPrice") or tick.get("lastPrice") or 0)
 
-    def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "isolated") -> Dict:
-        """設定槓桿"""
+    def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "isolated", hold_side: str = "both") -> Dict:
+        """設定槓桿 - POST /api/v1/account/set-leverage"""
         data = {
             "symbol": symbol,
-            "leverage": leverage,
+            "leverage": str(leverage),
             "marginMode": margin_mode,
-            "side": "both"  # Bitunix 通常需要 side
+            "holdSide": hold_side  # "long", "short", "both" (雙向持倉用 both)
         }
-        return self._request("POST", "/api/v1/account/leverage", data=data)
+        return self._request("POST", "/api/v1/account/set-leverage", data=data)
 
     def place_order(
         self,
         symbol: str,
-        side: str,              # "open_long" / "open_short"
-        size: float,            # 合約張數 (contracts)
+        side: str,              # "open_long", "open_short", "close_long", "close_short"
+        size: float,            # 合約張數
         leverage: int,
         tp_price: float = None,
         sl_price: float = None,
         margin_mode: str = "isolated",
         order_type: str = "market"
     ) -> Dict:
-        """下單 (支援 SL/TP) - 嘗試多個可能的端點"""
+        """下單 - POST /api/v1/trade/order (官方文檔標準端點)"""
         data = {
             "symbol": symbol,
+            "marginCoin": "USDT",
+            "size": str(size),
             "side": side,
             "orderType": order_type,
-            "size": str(size),
             "leverage": str(leverage),
             "marginMode": margin_mode,
-            "marginCoin": "USDT"
         }
+        if order_type == "limit":
+            # 限價單需 price，這裡假設市價單
+            pass
+        
         if tp_price:
-            data["takeProfitPrice"] = str(tp_price)
+            data["presetTakeProfitPrice"] = str(tp_price)
         if sl_price:
-            data["stopLossPrice"] = str(sl_price)
+            data["presetStopLossPrice"] = str(sl_price)
         
-        # Bitunix 常見下單端點（依優先序嘗試）
-        endpoints = [
-            "/api/v1/trade/order",           # 最常見
-            "/api/v1/private/trade/order",   # 私有端點
-            "/api/v1/trade/place-order",     # 原本嘗試
-            "/api/v1/private/trade/place-order",
-        ]
-        
-        last_error = None
-        for endpoint in endpoints:
-            try:
-                print(f"🔄 Trying endpoint: {endpoint}")
-                return self._request("POST", endpoint, data=data)
-            except Exception as e:
-                last_error = e
-                print(f"⚠️ Endpoint {endpoint} failed: {e}")
-                continue
-        
-        raise Exception(f"All order endpoints failed. Last error: {last_error}")
+        return self._request("POST", "/api/v1/trade/order", data=data)
 
     def get_positions(self, symbol: str = None) -> List[Dict]:
         params = {"symbol": symbol} if symbol else {}
         return self._request("GET", "/api/v1/position/current-positions", params=params)
+
+    def get_contract_info(self, symbol: str) -> Dict:
+        """查詢合約資訊 (面值、精度) - GET /api/v1/market/contracts"""
+        data = self._request("GET", "/api/v1/market/contracts", params={"symbol": symbol})
+        for c in data.get("contracts", []):
+            if c.get("symbol") == symbol:
+                return c
+        return {}
 
 
 # ============================================================
@@ -172,7 +167,7 @@ class BitunixClient:
 app = FastAPI(
     title="TradingView Webhook -> Bitunix Auto Trade",
     description="TV Alert -> 驗證 -> Bitunix 自動下單 (1% Equity, 10x, SL/TP 5%)",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 bitunix = BitunixClient()
@@ -231,7 +226,7 @@ async def authenticate_webhook(request: Request):
 def calculate_order_params(payload: Dict) -> Dict:
     """根據 TV payload 計算下單參數"""
     tv_payload = payload.get("payload", {})
-    symbol = tv_payload.get("ticker", "").replace(".P", "")  # Bitunix 通常不帶 .P
+    symbol = tv_payload.get("ticker", "").replace(".P", "")  # 移除 .P 後綴
     action = tv_payload.get("action", "").lower()
     entry_price = float(tv_payload.get("price", 0))
     
@@ -246,16 +241,13 @@ def calculate_order_params(payload: Dict) -> Dict:
     # 2. 計算保證金 (1% Equity)
     margin = equity * TRADE_EQUITY_PERCENT
     
-    # 3. 計算張數 (Contracts)
-    # Bitunix 通常是 USDT 本位合約，1 張 = 1 個合約面值 (如 BTC 0.001, ETH 0.01)
-    # 需要查詢合約面值。這裡簡化：假設 1 張 = 1 USDT 價值 (需根據實際合約調整)
-    # 實際公式: size = (margin * leverage) / entry_price / contract_size
-    # 這裡暫時假設 size = (margin * leverage) / entry_price (近似)
-    # 實際建議：先查詢合約資訊 /api/v1/market/contracts 獲取 contractSize
+    # 3. 計算張數
+    # 實際應查詢合約面值，這裡先用簡易公式: size = (margin * leverage) / entry_price
+    # 實際建議：查詢 /api/v1/market/contracts 獲取 contractSize 與 sizePrecision
     notional = margin * TRADE_LEVERAGE
     size = notional / entry_price if entry_price > 0 else 0
     
-    # 精度處理 (Bitunix 通常 size 精度 0.001 或 0.01)
+    # 精度處理：先統一到 3 位小數，實際需依合約 precision 調整
     size = round(size, 3)
     if size <= 0:
         raise ValueError(f"Calculated size too small: {size}")
@@ -276,7 +268,6 @@ def calculate_order_params(payload: Dict) -> Dict:
         else:
             raise ValueError(f"Unknown action: {action}")
     else:
-        # 如果 TV 沒送 price，抓當前價格
         current_price = bitunix.get_ticker_price(symbol)
         if action in ["buy", "long", "open_long"]:
             sl_price = round(current_price * (1 - TRADE_SL_PERCENT), 4)
@@ -309,7 +300,6 @@ async def receive_webhook(request: Request):
     try:
         data = await authenticate_webhook(request)
     except HTTPException as e:
-        # 驗證失敗也回 200 防止 TV 重試? 這裡維持 403 讓你知道失敗
         raise e
 
     payload = data
@@ -351,7 +341,6 @@ async def receive_webhook(request: Request):
 
     except Exception as e:
         print(f"❌ Trade Execution Failed: {e}")
-        # 回傳 200 防止 TV 重試，但記錄錯誤
         return {"status": "error", "message": str(e)}
 
 @app.get("/health")
@@ -368,6 +357,24 @@ async def test_trade(symbol: str = "BTCUSDT", side: str = "open_long", size: flo
         bitunix.set_leverage(symbol, 10, "isolated")
         result = bitunix.place_order(symbol, side, size, 10, margin_mode="isolated")
         return {"status": "success", "data": result}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/test/balance")
+async def test_balance():
+    """測試查餘額"""
+    try:
+        equity = bitunix.get_account_balance("USDT")
+        return {"status": "success", "equity": equity}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/test/ticker")
+async def test_ticker(symbol: str = "BTCUSDT"):
+    """測試查價格"""
+    try:
+        price = bitunix.get_ticker_price(symbol)
+        return {"status": "success", "symbol": symbol, "price": price}
     except Exception as e:
         raise HTTPException(500, str(e))
 
