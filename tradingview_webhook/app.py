@@ -197,6 +197,7 @@ class BitunixClient:
         order_type: str = "MARKET"
     ) -> Dict:
         """下單 - POST /api/v1/futures/trade/place_order (官方 Demo 端點)"""
+        # 官方 Demo 參數格式 (完全對齊 open_api_http_future_private.py)
         data = {
             "symbol": symbol,
             "side": side,                    # "BUY" / "SELL"
@@ -205,9 +206,6 @@ class BitunixClient:
             "tradeSide": "OPEN",             # 開倉
             "effect": "GTC",                 # Good Till Cancelled
             "reduceOnly": False,
-            "marginCoin": "USDT",            # 必填
-            "leverage": str(leverage),       # 槓桿
-            "marginMode": "ISOLATED" if margin_mode == "isolated" else "CROSSED",  # 大寫
         }
         
         return self._request("POST", "/api/v1/futures/trade/place_order", data=data)
