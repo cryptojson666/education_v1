@@ -126,8 +126,7 @@ class BitunixClient:
         margin_mode: str = "isolated",
         order_type: str = "market"
     ) -> Dict:
-        """下單 (支援 SL/TP)"""
-        # Bitunix 下單參數參考文檔調整
+        """下單 (支援 SL/TP) - 嘗試多個可能的端點"""
         data = {
             "symbol": symbol,
             "side": side,
@@ -142,7 +141,25 @@ class BitunixClient:
         if sl_price:
             data["stopLossPrice"] = str(sl_price)
         
-        return self._request("POST", "/api/v1/trade/place-order", data=data)
+        # Bitunix 常見下單端點（依優先序嘗試）
+        endpoints = [
+            "/api/v1/trade/order",           # 最常見
+            "/api/v1/private/trade/order",   # 私有端點
+            "/api/v1/trade/place-order",     # 原本嘗試
+            "/api/v1/private/trade/place-order",
+        ]
+        
+        last_error = None
+        for endpoint in endpoints:
+            try:
+                print(f"🔄 Trying endpoint: {endpoint}")
+                return self._request("POST", endpoint, data=data)
+            except Exception as e:
+                last_error = e
+                print(f"⚠️ Endpoint {endpoint} failed: {e}")
+                continue
+        
+        raise Exception(f"All order endpoints failed. Last error: {last_error}")
 
     def get_positions(self, symbol: str = None) -> List[Dict]:
         params = {"symbol": symbol} if symbol else {}
