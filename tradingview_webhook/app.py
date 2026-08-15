@@ -127,10 +127,14 @@ class BitunixClient:
                 method, 
                 f"{self.base_url}{endpoint}", 
                 headers=headers, 
-                params=params,  # GET 參數自動拼接到 URL
+                params=params,
                 data=body_str if method == "POST" else None,
                 timeout=10
             )
+            print(f"📤 Request: {method} {endpoint}")
+            print(f"📥 Response Status: {resp.status_code}")
+            print(f"📥 Response Body: {resp.text}")
+            
             resp.raise_for_status()
             result = resp.json()
             if result.get("code") != 0:
