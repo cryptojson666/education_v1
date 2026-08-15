@@ -35,12 +35,12 @@ TRADE_MARGIN_MODE = os.getenv("TRADE_MARGIN_MODE", "isolated")
 
 app = FastAPI(
     title="TradingView Webhook -> Bitunix Auto Trade",
-    description="TV Alert -> 驗證 -> Bitunix 自動下單 (1% Equity, 10x, SL/TP 5%)",
-    version="2.3.0"
+    description="TV Alert -> 驗證 -> Bitunix 自動下單 (官方 Demo 模式)",
+    version="2.4.0"
 )
 
 # ============================================================
-# Bitunix API Client (完全參考官方 Python Demo)
+# Bitunix API Client (完全對齊官方 Python Demo)
 # 參考: /c/Users/chungweng22/open-api/Demo/Python/
 # ============================================================
 class BitunixClient:
@@ -64,50 +64,55 @@ class BitunixClient:
         return str(int(time.time() * 1000))
 
     def _sort_params(self, params: Dict) -> str:
-        """參數排序並拼接: k1v1k2v2..."""
+        """參數排序並拼接: k1v1k2v2... (官方 sort_params)"""
         if not params:
             return ""
         return ''.join(f"{k}{v}" for k, v in sorted(params.items()))
 
-    def _generate_signature(self, query_params: str = "", body: str = "") -> tuple:
-        """生成簽名 (完全對齊 open_api_http_sign.py)
+    def _generate_signature(self, method: str, endpoint: str, params: Dict = None, body: str = "") -> tuple:
+        """生成簽名 (完全對齊官方 open_api_http_sign.py)
         
+        簽名邏輯:
+        1. nonce + timestamp + api_key + query_params + body
+        2. SHA256 hex -> + secret_key -> SHA256 hex
+        
+        Args:
+            method: HTTP method
+            endpoint: API endpoint (不含 query string)
+            params: GET 參數字典 (會排序拼接)
+            body: JSON 字串 (POST body)
+            
         Returns:
             (sign, nonce, timestamp)
         """
         nonce = str(uuid.uuid4()).replace('-', '')
         timestamp = str(int(time.time() * 1000))
         
-        # 簽名輸入: nonce + timestamp + api_key + query_params + body
-        query_params_str = ""  # GET 參數已在 URL 中，這裡為空字串
+        # 1. 處理 GET 參數: 排序後拼接 k1v1k2v2...
+        query_params_str = self._sort_params(params) if params else ""
+        
+        # 2. Body 處理: 緊湊 JSON (無空格)
         body_str = body if body else ""
         
+        # 3. 簽名輸入: nonce + timestamp + api_key + query_params + body
         digest_input = f"{nonce}{timestamp}{self.api_key}{query_params_str}{body_str}"
         digest = hashlib.sha256(digest_input.encode('utf-8')).hexdigest()
         
+        # 4. 雙重 SHA256: digest + secret_key -> SHA256 hex
         sign_input = digest + self.secret_key
         sign = hashlib.sha256(sign_input.encode('utf-8')).hexdigest()
         
         return sign, nonce, timestamp
 
-    def _auth_headers(self, query_params: str = "", body: str = "") -> Dict[str, str]:
-        """生成認證 Headers (對齊官方 get_auth_headers)"""
-        sign, nonce, timestamp = self._generate_signature(query_params="", body=body)
-        return {
-            "Content-Type": "application/json",
-            "language": "en-US",
-            "api-key": self.api_key,
-            "sign": sign,
-            "nonce": sign.split('|')[0] if '|' in sign else self._nonce(),  # 實際用 nonce
-            "timestamp": str(int(time.time() * 1000)),
-        }
-
     def _request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None) -> Dict:
-        url = f"{self.base_url}{endpoint}"
-        body = json.dumps(data) if data else ""
+        """發送請求 (自動處理簽名)"""
+        # 1. 準備 Body 字串 (緊湊 JSON)
+        body_str = json.dumps(data, separators=(',', ':')) if data else ""
         
-        # 生成認證 headers
-        sign, nonce, timestamp = self._generate_signature(body=body)
+        # 2. 生成簽名 (自動處理 GET 參數排序)
+        sign, nonce, timestamp = self._generate_signature(method, endpoint, params, body_str if method == "POST" else "")
+        
+        # 2. 請求 Headers
         headers = {
             "Content-Type": "application/json",
             "language": "en-US",
@@ -122,8 +127,8 @@ class BitunixClient:
                 method, 
                 f"{self.base_url}{endpoint}", 
                 headers=headers, 
-                params=params, 
-                data=body, 
+                params=params,  # GET 參數自動拼接到 URL
+                data=body_str if method == "POST" else None,
                 timeout=10
             )
             resp.raise_for_status()
@@ -152,7 +157,6 @@ class BitunixClient:
     def get_ticker_price(self, symbol: str) -> float:
         """獲取最新價格 - GET /api/v1/futures/market/tickers"""
         data = self._request("GET", "/api/v1/futures/market/tickers", params={"symbols": symbol})
-        # 官方回傳: data.list[].lastPr / markPrice
         if isinstance(data, dict) and "list" in data:
             for tick in data["list"]:
                 if tick.get("symbol") == symbol:
@@ -160,8 +164,7 @@ class BitunixClient:
         return 0.0
 
     def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "isolated") -> Dict:
-        """設定槓桿 - 官方無單獨設定槓桿端點，下單時帶 leverage 參數"""
-        # 官方 Demo 無獨立設定槓桿端點，下單時帶 leverage 參數
+        """官方 Demo 無獨立設定槓桿端點，下單時帶 leverage 參數"""
         return {"success": True}
 
     def place_order(
@@ -176,7 +179,6 @@ class BitunixClient:
         order_type: str = "MARKET"
     ) -> Dict:
         """下單 - POST /api/v1/futures/trade/place_order (官方 Demo 端點)"""
-        # 官方參數格式
         data = {
             "symbol": symbol,
             "side": side,                    # "BUY" / "SELL"
@@ -187,24 +189,14 @@ class BitunixClient:
             "reduceOnly": False,
         }
         
-        if tp_price:
-            # 官方 Demo 支援 tpPrice, tpStopType, tpOrderType, tpOrderPrice
-            pass  # 官方 Demo 參數名: tpPrice, tpStopType, tpOrderType, tpOrderPrice
-        
-        if sl_price:
-            # 官方無直接 SL 參數，需自行處理或使用條件單
-            pass
-        
         return self._request("POST", "/api/v1/futures/trade/place_order", data=data)
 
     def get_positions(self, symbol: str = None) -> List[Dict]:
-        # 官方無直接當前持倉端點，需用歷史持倉或其他方式
         return []
 
     def get_ticker_price_simple(self, symbol: str) -> float:
         """簡易獲取價格 - 公開端點無需簽名"""
         try:
-            url = f"{self.base_url}/api/v1/futures/market/tickers"
             resp = self.session.get(f"{self.base_url}/api/v1/futures/market/tickers", params={"symbols": symbol}, timeout=5)
             result = resp.json()
             if result.get("code") == 0 and "list" in result.get("data", {}):
@@ -222,7 +214,7 @@ class BitunixClient:
 app = FastAPI(
     title="TradingView Webhook -> Bitunix Auto Trade",
     description="TV Alert -> 驗證 -> Bitunix 自動下單 (官方 Demo 模式)",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 bitunix = BitunixClient()
@@ -310,7 +302,7 @@ def calculate_order_params(payload: Dict) -> Dict:
         if action in ["buy", "long", "open_long"]:
             sl_price = round(entry_price * (1 - TRADE_SL_PERCENT), 4)
             tp_price = round(entry_price * (1 + TRADE_TP_PERCENT), 4)
-            side = "BUY"  # 官方用 BUY/SELL
+            side = "BUY"
         elif action in ["sell", "short", "open_short"]:
             sl_price = round(entry_price * (1 + TRADE_SL_PERCENT), 4)
             tp_price = round(entry_price * (1 - TRADE_TP_PERCENT), 4)
@@ -318,7 +310,7 @@ def calculate_order_params(payload: Dict) -> Dict:
         else:
             raise ValueError(f"Unknown action: {action}")
     else:
-        current_price = bitunix.get_ticker_price_simple(symbol)
+        current_price = bitunix.get_ticker_price(symbol)
         if action in ["buy", "long", "open_long"]:
             sl_price = round(current_price * (1 - TRADE_SL_PERCENT), 4)
             tp_price = round(current_price * (1 + TRADE_TP_PERCENT), 4)
@@ -402,7 +394,7 @@ async def test_balance():
 @app.get("/test/ticker")
 async def test_ticker(symbol: str = "BTCUSDT"):
     try:
-        price = bitunix.get_ticker_price_simple(symbol)
+        price = bitunix.get_ticker_price(symbol)
         return {"status": "success", "symbol": symbol, "price": price}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -414,11 +406,6 @@ async def test_trade(symbol: str = "BTCUSDT", side: str = "BUY", size: float = 0
         return {"status": "success", "data": result}
     except Exception as e:
         raise HTTPException(500, str(e))
-
-@app.get("/test/scan")
-async def test_scan():
-    """掃描端點"""
-    return {"message": "Run balance/ticker tests instead"}
 
 if __name__ == "__main__":
     import uvicorn
