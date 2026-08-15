@@ -143,16 +143,30 @@ class BitunixClient:
     def get_account_balance(self, margin_coin: str = "USDT") -> float:
         """獲取帳戶資產 - GET /api/v1/futures/account?marginCoin=USDT"""
         data = self._request("GET", "/api/v1/futures/account", params={"marginCoin": "USDT"})
-        # 官方回傳格式: data.list[].equity / available
-        if isinstance(data, dict) and "list" in data:
-            for asset in data["list"]:
-                if asset.get("marginCoin") == "USDT":
-                    return float(asset.get("equity", 0) or asset.get("available", 0))
+        # 官方回傳格式: 直接物件 {marginCoin, available, equity, ...}
+        if isinstance(data, dict):
+            # 直接物件格式: {marginCoin: USDT, available: ..., equity: ...}
+            if data.get("marginCoin") == margin_coin:
+                equity = data.get("equity") or data.get("available") or data.get("balance")
+                if equity:
+                    return float(equity)
+            # 或是包裹在 data 內
+            if "data" in data and isinstance(data["data"], dict):
+                return self.get_account_balance_from_dict(data["data"], margin_coin)
         elif isinstance(data, list):
             for asset in data:
-                if asset.get("marginCoin") == "USDT":
-                    return float(asset.get("equity", 0) or asset.get("available", 0))
+                if asset.get("marginCoin") == margin_coin:
+                    equity = asset.get("equity") or asset.get("available") or asset.get("balance")
+                    if equity:
+                        return float(equity)
         raise Exception(f"Unexpected balance response: {data}")
+    
+    def get_account_balance_from_dict(self, data: dict, margin_coin: str) -> float:
+        if data.get("marginCoin") == margin_coin:
+            equity = data.get("equity") or data.get("available") or data.get("balance")
+            if equity:
+                return float(equity)
+        raise Exception(f"Balance not found in response")
 
     def get_ticker_price(self, symbol: str) -> float:
         """獲取最新價格 - GET /api/v1/futures/market/tickers"""
