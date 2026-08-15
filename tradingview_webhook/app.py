@@ -120,36 +120,74 @@ class BitunixClient:
             raise Exception(f"Network Error: {e}")
 
     # ---------- 合約資訊快取 ----------
-    def _load_contracts_info(self):
+def _load_contracts_info(self):
         """快取所有合約精度資訊"""
         try:
-            data = self._request("GET", "/api/v1/futures/market/contracts")
-            contracts = data.get("list", []) or data.get("contracts", []) or data.get("list", [])
-            for c in contracts:
-                sym = c.get("symbol")
-                if sym:
-                    self._symbol_precision_cache[sym] = {
-                        "size_precision": int(c.get("sizePrecision", 3)),
-                        "price_precision": int(c.get("pricePrecision", 4)),
-                        "min_qty": float(c.get("minQty", 0)),
-                        "contract_size": float(c.get("contractSize", 1)),
-                    }
+            # 嘗試多個可能的端點
+            endpoints = [
+                "/api/v1/futures/market/contracts",
+                "/api/v1/futures/market/trading_pairs",
+                "/api/v1/futures/market/symbols",
+                "/api/v1/market/contracts",
+                "/api/v1/futures/market/contracts/list",
+            ]
+            for endpoint in endpoints:
+                try:
+                    data = self._request("GET", endpoint)
+                    contracts = data.get("list", []) or data.get("contracts", []) or data.get("data", []) or data
+                    if isinstance(contracts, list) and contracts:
+                        for c in contracts:
+                            sym = c.get("symbol")
+                            if sym:
+                                self._symbol_precision_cache[sym] = {
+                                    "size_precision": int(c.get("sizePrecision", 3)),
+                                    "price_precision": int(c.get("pricePrecision", 4)),
+                                    "min_qty": float(c.get("minQty", 0) or c.get("minQty", 0) or c.get("minOrderQty", 0)),
+                                }
+                        if self._symbol_precision_cache:
+                            print(f"✅ Loaded {len(self._symbol_precision_cache)} contracts from {endpoint}")
+                            return
+                except Exception as e:
+                    continue
         except Exception as e:
             print(f"⚠️ Failed to load contracts info: {e}")
+        
+        # Fallback: 常見幣種最小量 (若 API 端點不可用)
+        self._symbol_precision_cache.update({
+            "BTCUSDT": {"size_precision": 3, "price_precision": 1, "min_qty": 0.001},
+            "ETHUSDT": {"size_precision": 3, "price_precision": 2, "min_qty": 0.01},
+            "STXUSDT": {"size_precision": 0, "price_precision": 4, "min_qty": 200},
+            "SOLUSDT": {"size_precision": 2, "price_precision": 3, "min_qty": 0.1},
+            "DOGEUSDT": {"size_precision": 0, "price_precision": 5, "min_qty": 100},
+            "XRPUSDT": {"size_precision": 1, "price_precision": 4, "min_qty": 10},
+            "ADAUSDT": {"size_precision": 1, "price_precision": 4, "min_qty": 10},
+            "MATICUSDT": {"size_precision": 1, "price_precision": 4, "min_qty": 10},
+            "AVAXUSDT": {"size_precision": 2, "price_precision": 3, "min_qty": 0.1},
+            "DOTUSDT": {"size_precision": 1, "price_precision": 3, "min_qty": 1},
+            "LINKUSDT": {"size_precision": 2, "price_precision": 3, "min_qty": 0.1},
+            "LTCUSDT": {"size_precision": 3, "price_precision": 2, "min_qty": 0.01},
+            "BCHUSDT": {"size_precision": 3, "price_precision": 2, "min_qty": 0.01},
+            "UNIUSDT": {"size_precision": 2, "price_precision": 3, "min_qty": 0.1},
+            "ATOMUSDT": {"size_precision": 2, "price_precision": 3, "min_qty": 0.1},
+            "ETCUSDT": {"size_precision": 2, "price_precision": 3, "min_qty": 0.1},
+            "FILUSDT": {"size_precision": 2, "price_precision": 3, "min_qty": 0.1},
+            "TRXUSDT": {"size_precision": 0, "price_precision": 5, "min_qty": 100},
+            "XRPUSDT": {"size_precision": 1, "price_precision": 4, "min_qty": 10},
+        })
 
     def _get_symbol_precision(self, symbol: str) -> Dict:
         if not self._symbol_precision_cache:
             self._load_contracts_info()
         return self._symbol_precision_cache.get(symbol, {"size_precision": 3, "price_precision": 4, "min_qty": 0.001})
 
-    def _quantize_size(self, symbol: str, size: float) -> str:
-        """根據合約精度量化 size"""
+def _quantize_size(self, symbol: str, size: float) -> str:
+        """根據合約精度量化 size，強制檢查 min_qty"""
         prec = self._get_symbol_precision(symbol)
         step = 10 ** (-prec["size_precision"])
         quantized = round(size / step) * step
         min_qty = prec.get("min_qty", 0)
         if quantized < min_qty:
-            raise ValueError(f"Size {quantized} below min_qty {min_qty} for {symbol}")
+            raise ValueError(f"Size {quantized} below min_qty {min_qty} for {symbol} (need at least {min_qty})")
         return f"{quantized:.{prec['size_precision']}f}"
 
     def _clean_symbol(self, symbol: str) -> str:
@@ -272,7 +310,7 @@ class BitunixClient:
             "symbol": symbol,
             "side": side,                    # "BUY" / "SELL"
             "orderType": order_type,         # MARKET / LIMIT
-            "qty": str(size),                # 先用原始 size，_quantize 已處理
+            "qty": qty_str,                  # 使用量化後的 size
             "tradeSide": "OPEN",             # 開倉
             "reduceOnly": False,
         }
