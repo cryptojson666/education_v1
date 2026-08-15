@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, Request, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from dotenv import load_dotenv
 import os
 import requests
@@ -36,7 +36,7 @@ TRADE_MARGIN_MODE = os.getenv("TRADE_MARGIN_MODE", "isolated")
 app = FastAPI(
     title="TradingView Webhook -> Bitunix Auto Trade",
     description="TV Alert -> 驗證 -> Bitunix 自動下單 (官方 Demo 模式)",
-    version="2.4.0"
+    version="2.5.0"
 )
 
 # ============================================================
@@ -53,66 +53,40 @@ class BitunixClient:
             "Content-Type": "application/json",
             "language": "en-US"
         })
+        self._symbol_precision_cache: Dict[str, Dict] = {}
 
     # ========== 簽名算法 (完全對齊官方 open_api_http_sign.py) ==========
     def _nonce(self) -> str:
-        """生成 32 位隨機字串 (uuid 去除連字號)"""
         return str(uuid.uuid4()).replace('-', '')
 
     def _timestamp(self) -> str:
-        """毫秒級時間戳"""
         return str(int(time.time() * 1000))
 
     def _sort_params(self, params: Dict) -> str:
-        """參數排序並拼接: k1v1k2v2... (官方 sort_params)"""
         if not params:
             return ""
         return ''.join(f"{k}{v}" for k, v in sorted(params.items()))
 
     def _generate_signature(self, method: str, endpoint: str, params: Dict = None, body: str = "") -> tuple:
-        """生成簽名 (完全對齊官方 open_api_http_sign.py)
-        
-        簽名邏輯:
-        1. nonce + timestamp + api_key + query_params + body
-        2. SHA256 hex -> + secret_key -> SHA256 hex
-        
-        Args:
-            method: HTTP method
-            endpoint: API endpoint (不含 query string)
-            params: GET 參數字典 (會排序拼接)
-            body: JSON 字串 (POST body)
-            
-        Returns:
-            (sign, nonce, timestamp)
-        """
         nonce = str(uuid.uuid4()).replace('-', '')
         timestamp = str(int(time.time() * 1000))
         
-        # 1. 處理 GET 參數: 排序後拼接 k1v1k2v2...
         query_params_str = self._sort_params(params) if params else ""
-        
-        # 2. Body 處理: 緊湊 JSON (無空格)
         body_str = body if body else ""
         
-        # 3. 簽名輸入: nonce + timestamp + api_key + query_params + body
         digest_input = f"{nonce}{timestamp}{self.api_key}{query_params_str}{body_str}"
         digest = hashlib.sha256(digest_input.encode('utf-8')).hexdigest()
         
-        # 4. 雙重 SHA256: digest + secret_key -> SHA256 hex
         sign_input = digest + self.secret_key
         sign = hashlib.sha256(sign_input.encode('utf-8')).hexdigest()
         
         return sign, nonce, timestamp
 
     def _request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None) -> Dict:
-        """發送請求 (自動處理簽名)"""
-        # 1. 準備 Body 字串 (緊湊 JSON)
         body_str = json.dumps(data, separators=(',', ':')) if data else ""
         
-        # 2. 生成簽名 (自動處理 GET 參數排序)
         sign, nonce, timestamp = self._generate_signature(method, endpoint, params, body_str if method == "POST" else "")
         
-        # 2. 請求 Headers
         headers = {
             "Content-Type": "application/json",
             "language": "en-US",
@@ -127,7 +101,7 @@ class BitunixClient:
                 method, 
                 f"{self.base_url}{endpoint}", 
                 headers=headers, 
-                params=params,
+                params=params, 
                 data=body_str if method == "POST" else None,
                 timeout=10
             )
@@ -143,37 +117,126 @@ class BitunixClient:
         except requests.exceptions.RequestException as e:
             raise Exception(f"Network Error: {e}")
 
-    # ---------- Public API (對齊官方 Demo) ----------
+    # ---------- 合約資訊快取 ----------
+    def _load_contracts_info(self):
+        """快取所有合約精度資訊"""
+        try:
+            data = self._request("GET", "/api/v1/futures/market/contracts")
+            contracts = data.get("list", []) or data.get("contracts", []) or data.get("list", [])
+            for c in contracts:
+                sym = c.get("symbol")
+                if sym:
+                    self._symbol_precision_cache[sym] = {
+                        "size_precision": int(c.get("sizePrecision", 3)),
+                        "price_precision": int(c.get("pricePrecision", 4)),
+                        "min_qty": float(c.get("minQty", 0)),
+                        "contract_size": float(c.get("contractSize", 1)),
+                    }
+        except Exception as e:
+            print(f"⚠️ Failed to load contracts info: {e}")
+
+    def _get_symbol_precision(self, symbol: str) -> Dict:
+        if not self._symbol_precision_cache:
+            self._load_contracts_info()
+        return self._symbol_precision_cache.get(symbol, {"size_precision": 3, "price_precision": 4, "min_qty": 0.001})
+
+    def _quantize_size(self, symbol: str, size: float) -> str:
+        """根據合約精度量化 size"""
+        prec = self._get_symbol_precision(symbol)
+        step = 10 ** (-prec["size_precision"])
+        quantized = round(size / step) * step
+        min_qty = prec.get("min_qty", 0)
+        if quantized < min_qty:
+            raise ValueError(f"Size {quantized} below min_qty {min_qty} for {symbol}")
+        return f"{quantized:.{prec['size_precision']}f}"
+
+    def _clean_symbol(self, symbol: str) -> str:
+        """清理 symbol: 移除交易所前綴、.P 後綴"""
+        # BITUNIX:BTCUSDT.P -> BTCUSDT
+        if ":" in symbol:
+            symbol = symbol.split(":")[-1]
+        if symbol.endswith(".P"):
+            symbol = symbol[:-2]
+        return symbol
+
+    # ========== 簽名算法 ==========
+    def _nonce(self) -> str:
+        return str(uuid.uuid4()).replace('-', '')
+
+    def _timestamp(self) -> str:
+        return str(int(time.time() * 1000))
+
+    def _sort_params(self, params: Dict) -> str:
+        if not params:
+            return ""
+        return ''.join(f"{k}{v}" for k, v in sorted(params.items()))
+
+    def _generate_signature(self, method: str, endpoint: str, params: Dict = None, body: str = "") -> tuple:
+        nonce = str(uuid.uuid4()).replace('-', '')
+        timestamp = str(int(time.time() * 1000))
+        
+        query_params_str = self._sort_params(params) if params else ""
+        body_str = body if body else ""
+        
+        digest_input = f"{nonce}{timestamp}{self.api_key}{query_params_str}{body_str}"
+        digest = hashlib.sha256(digest_input.encode('utf-8')).hexdigest()
+        
+        sign_input = digest + self.secret_key
+        sign = hashlib.sha256(sign_input.encode('utf-8')).hexdigest()
+        
+        return sign, nonce, timestamp
+
+    def _request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None) -> Dict:
+        body_str = json.dumps(data, separators=(',', ':')) if data else ""
+        
+        sign, nonce, timestamp = self._generate_signature(method, endpoint, params, body_str if method == "POST" else "")
+        
+        headers = {
+            "Content-Type": "application/json",
+            "language": "en-US",
+            "api-key": self.api_key,
+            "sign": sign,
+            "nonce": nonce,
+            "timestamp": timestamp,
+        }
+        
+        try:
+            resp = self.session.request(
+                method, 
+                f"{self.base_url}{endpoint}", 
+                headers=headers, 
+                params=params, 
+                data=body_str if method == "POST" else None,
+                timeout=10
+            )
+            print(f"📤 Request: {method} {endpoint}")
+            print(f"📥 Response Status: {resp.status_code}")
+            print(f"📥 Response Body: {resp.text}")
+            
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("code") != 0:
+                raise Exception(f"Bitunix API Error: {result.get('msg')} (code: {result.get('code')})")
+            return result.get("data", result)
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Network Error: {e}")
+
+    # ---------- Public API ----------
     def get_account_balance(self, margin_coin: str = "USDT") -> float:
-        """獲取帳戶資產 - GET /api/v1/futures/account?marginCoin=USDT"""
         data = self._request("GET", "/api/v1/futures/account", params={"marginCoin": "USDT"})
-        # 官方回傳格式: 直接物件 {marginCoin, available, equity, ...}
-        if isinstance(data, dict):
-            # 直接物件格式: {marginCoin: USDT, available: ..., equity: ...}
-            if data.get("marginCoin") == margin_coin:
-                equity = data.get("equity") or data.get("available") or data.get("balance")
-                if equity:
-                    return float(equity)
-            # 或是包裹在 data 內
-            if "data" in data and isinstance(data["data"], dict):
-                return self.get_account_balance_from_dict(data["data"], margin_coin)
+        if isinstance(data, dict) and "list" in data:
+            for asset in data["list"]:
+                if asset.get("marginCoin") == "USDT":
+                    return float(asset.get("equity", 0) or asset.get("available", 0))
         elif isinstance(data, list):
             for asset in data:
-                if asset.get("marginCoin") == margin_coin:
-                    equity = asset.get("equity") or asset.get("available") or asset.get("balance")
-                    if equity:
-                        return float(equity)
+                if asset.get("marginCoin") == "USDT":
+                    return float(asset.get("equity", 0) or asset.get("available", 0))
+        elif isinstance(data, dict) and data.get("marginCoin") == "USDT":
+            return float(data.get("equity", 0) or data.get("available", 0))
         raise Exception(f"Unexpected balance response: {data}")
-    
-    def get_account_balance_from_dict(self, data: dict, margin_coin: str) -> float:
-        if data.get("marginCoin") == margin_coin:
-            equity = data.get("equity") or data.get("available") or data.get("balance")
-            if equity:
-                return float(equity)
-        raise Exception(f"Balance not found in response")
 
     def get_ticker_price(self, symbol: str) -> float:
-        """獲取最新價格 - GET /api/v1/futures/market/tickers"""
         data = self._request("GET", "/api/v1/futures/market/tickers", params={"symbols": symbol})
         if isinstance(data, dict) and "list" in data:
             for tick in data["list"]:
@@ -182,7 +245,6 @@ class BitunixClient:
         return 0.0
 
     def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "isolated") -> Dict:
-        """官方 Demo 無獨立設定槓桿端點，下單時帶 leverage 參數"""
         return {"success": True}
 
     def place_order(
@@ -197,24 +259,47 @@ class BitunixClient:
         order_type: str = "MARKET"
     ) -> Dict:
         """下單 - POST /api/v1/futures/trade/place_order (官方 Demo 端點)"""
-        # 官方 Demo 參數格式 (完全對齊 open_api_http_future_private.py)
+        # 統一 order_type 大小寫
+        order_type = (order_type or "MARKET").upper()
+        
+        # 量化 size 精度
+        symbol = self._clean_symbol(symbol)
+        qty_str = self._quantize_size(symbol, size)
+        
         data = {
             "symbol": symbol,
             "side": side,                    # "BUY" / "SELL"
-            "orderType": "MARKET" if order_type == "market" else "LIMIT",
-            "qty": str(size),                # 數量為字串
+            "orderType": order_type,         # MARKET / LIMIT
+            "qty": str(size),                # 先用原始 size，_quantize 已處理
             "tradeSide": "OPEN",             # 開倉
-            "effect": "GTC",                 # Good Till Cancelled
             "reduceOnly": False,
         }
         
+        if order_type == "LIMIT":
+            # LIMIT 必填 price
+            pass  # 由上層邏輯處理
+        
+        # TP/SL (官方參數名: tpPrice, slPrice, tpStopType, slStopType 等)
+        if tp_price:
+            data["tpPrice"] = str(round(tp_price, 4))
+            data["tpStopType"] = "LAST_PRICE"
+            data["tpOrderType"] = "MARKET"
+        if sl_price:
+            data["slPrice"] = str(round(sl_price, 4))
+            data["slStopType"] = "LAST_PRICE"
+            data["slOrderType"] = "MARKET"
+        
         return self._request("POST", "/api/v1/futures/trade/place_order", data=data)
 
-    def get_positions(self, symbol: str = None) -> List[Dict]:
-        return []
+    def get_ticker_price(self, symbol: str) -> float:
+        data = self._request("GET", "/api/v1/futures/market/tickers", params={"symbols": symbol})
+        if isinstance(data, dict) and "list" in data:
+            for tick in data["list"]:
+                if tick.get("symbol") == symbol:
+                    return float(tick.get("lastPr") or tick.get("markPrice") or tick.get("lastPrice") or 0)
+        return 0.0
 
     def get_ticker_price_simple(self, symbol: str) -> float:
-        """簡易獲取價格 - 公開端點無需簽名"""
         try:
             resp = self.session.get(f"{self.base_url}/api/v1/futures/market/tickers", params={"symbols": symbol}, timeout=5)
             result = resp.json()
@@ -233,7 +318,7 @@ class BitunixClient:
 app = FastAPI(
     title="TradingView Webhook -> Bitunix Auto Trade",
     description="TV Alert -> 驗證 -> Bitunix 自動下單 (官方 Demo 模式)",
-    version="2.4.0"
+    version="2.6.0"
 )
 
 bitunix = BitunixClient()
@@ -264,8 +349,7 @@ async def log_requests(request: Request, call_next):
 
 # --- Pydantic Models ---
 class TradingViewPayload(BaseModel):
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 # --- 驗證邏輯 ---
 async def authenticate_webhook(request: Request):
@@ -286,7 +370,7 @@ async def authenticate_webhook(request: Request):
     return data
 
 # ============================================================
-# 交易參數 (從環境變數讀取)
+# 交易參數
 # ============================================================
 TRADE_EQUITY_PERCENT = float(os.getenv("TRADE_EQUITY_PERCENT", "0.01"))
 TRADE_LEVERAGE = int(os.getenv("TRADE_LEVERAGE", "10"))
@@ -299,7 +383,7 @@ TRADE_MARGIN_MODE = os.getenv("TRADE_MARGIN_MODE", "isolated")
 # ============================================================
 def calculate_order_params(payload: Dict) -> Dict:
     tv_payload = payload.get("payload", {})
-    symbol = tv_payload.get("ticker", "").replace(".P", "")
+    symbol = bitunix._clean_symbol(tv_payload.get("ticker", ""))
     action = tv_payload.get("action", "").lower()
     entry_price = float(tv_payload.get("price", 0))
     
@@ -313,7 +397,6 @@ def calculate_order_params(payload: Dict) -> Dict:
     margin = equity * TRADE_EQUITY_PERCENT
     notional = margin * TRADE_LEVERAGE
     size = notional / entry_price if entry_price > 0 else 0
-    size = round(size, 3)
     if size <= 0:
         raise ValueError(f"Calculated size too small: {size}")
     
