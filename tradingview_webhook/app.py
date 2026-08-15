@@ -28,10 +28,12 @@ BITUNIX_BASE_URL = os.getenv("BITUNIX_BASE_URL", "https://fapi.bitunix.com")
 
 # 交易參數
 TRADE_EQUITY_PERCENT = float(os.getenv("TRADE_EQUITY_PERCENT", "0.01"))
+TRADE_FIXED_USDT = float(os.getenv("TRADE_FIXED_USDT", "1.0"))      # 固定 1 USDT
 TRADE_LEVERAGE = int(os.getenv("TRADE_LEVERAGE", "10"))
 TRADE_SL_PERCENT = float(os.getenv("TRADE_SL_PERCENT", "0.05"))
 TRADE_TP_PERCENT = float(os.getenv("TRADE_TP_PERCENT", "0.05"))
 TRADE_MARGIN_MODE = os.getenv("TRADE_MARGIN_MODE", "isolated")
+TRADE_USE_FIXED_USDT = os.getenv("TRADE_USE_FIXED_USDT", "true").lower() == "true"  # true=固定USDT, false=百分比
 
 app = FastAPI(
     title="TradingView Webhook -> Bitunix Auto Trade",
@@ -373,10 +375,12 @@ async def authenticate_webhook(request: Request):
 # 交易參數
 # ============================================================
 TRADE_EQUITY_PERCENT = float(os.getenv("TRADE_EQUITY_PERCENT", "0.01"))
+TRADE_FIXED_USDT = float(os.getenv("TRADE_FIXED_USDT", "1.0"))      # 固定 1 USDT
 TRADE_LEVERAGE = int(os.getenv("TRADE_LEVERAGE", "10"))
 TRADE_SL_PERCENT = float(os.getenv("TRADE_SL_PERCENT", "0.05"))
 TRADE_TP_PERCENT = float(os.getenv("TRADE_TP_PERCENT", "0.05"))
 TRADE_MARGIN_MODE = os.getenv("TRADE_MARGIN_MODE", "isolated")
+TRADE_USE_FIXED_USDT = os.getenv("TRADE_USE_FIXED_USDT", "true").lower() == "true"  # true=固定USDT, false=百分比
 
 # ============================================================
 # 交易核心邏輯
@@ -390,11 +394,15 @@ def calculate_order_params(payload: Dict) -> Dict:
     if not symbol or not action:
         raise ValueError("Missing symbol or action in payload")
     
-    equity = bitunix.get_account_balance("USDT")
-    if equity <= 0:
-        raise Exception("USDT Equity is 0 or failed to fetch")
+    # 計算下單張數：固定 USDT 或百分比
+    if TRADE_USE_FIXED_USDT:
+        margin = TRADE_FIXED_USDT  # 固定 1 USDT
+    else:
+        equity = bitunix.get_account_balance("USDT")
+        if equity <= 0:
+            raise Exception("USDT Equity is 0 or failed to fetch")
+        margin = equity * TRADE_EQUITY_PERCENT
     
-    margin = equity * TRADE_EQUITY_PERCENT
     notional = margin * TRADE_LEVERAGE
     size = notional / entry_price if entry_price > 0 else 0
     if size <= 0:
